@@ -12,8 +12,6 @@ namespace makoveeva_matmul_double_omp {
 
 namespace {
 
-constexpr size_t kDefaultBlockSize = 64;
-
 // Получить оптимальный размер блока для алгоритма Фокса
 size_t GetOptimalBlockSize(size_t n) {
   // Используем степени двойки для лучшей локальности кэша
