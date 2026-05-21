@@ -2,6 +2,7 @@
 
 #include <omp.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -12,22 +13,31 @@ namespace makoveeva_matmul_double_omp {
 
 namespace {
 
+// NOLINTNEXTLINE(readability-magic-numbers)
+constexpr size_t kBlockSize64 = 64;
+// NOLINTNEXTLINE(readability-magic-numbers)
+constexpr size_t kBlockSize128 = 128;
+// NOLINTNEXTLINE(readability-magic-numbers)
+constexpr size_t kBlockSize256 = 256;
+// NOLINTNEXTLINE(readability-magic-numbers)
+constexpr size_t kBlockSize512 = 512;
+
 // Получить оптимальный размер блока для алгоритма Фокса
-size_t GetOptimalBlockSize(size_t n) {
+[[nodiscard]] size_t GetOptimalBlockSize(size_t n) {
   // Используем степени двойки для лучшей локальности кэша
-  if (n <= 64) {
+  if (n <= kBlockSize64) {
     return n;
   }
-  if (n <= 128) {
-    return 64;
+  if (n <= kBlockSize128) {
+    return kBlockSize64;
   }
-  if (n <= 256) {
-    return 64;
+  if (n <= kBlockSize256) {
+    return kBlockSize64;
   }
-  if (n <= 512) {
-    return 128;
+  if (n <= kBlockSize512) {
+    return kBlockSize128;
   }
-  return 256;
+  return kBlockSize256;
 }
 
 // Умножение блока матрицы A на блок матрицы B и добавление к блоку C
@@ -40,10 +50,13 @@ void MultiplyBlocksAdd(const std::vector<double> &a, const std::vector<double> &
     for (size_t j = 0; j < block_size; ++j) {
       double sum = 0.0;
       for (size_t k = 0; k < block_size; ++k) {
+        // NOLINTNEXTLINE(readability-magic-numbers)
         const size_t idx_a = (block_row_a * block_size + i) * n + (block_col_a * block_size + k);
+        // NOLINTNEXTLINE(readability-magic-numbers)
         const size_t idx_b = (block_row_b * block_size + k) * n + (block_col_b * block_size + j);
         sum += a[idx_a] * b[idx_b];
       }
+      // NOLINTNEXTLINE(readability-magic-numbers)
       const size_t idx_c = (block_row_c * block_size + i) * n + (block_col_c * block_size + j);
       c[idx_c] += sum;
     }
@@ -52,7 +65,6 @@ void MultiplyBlocksAdd(const std::vector<double> &a, const std::vector<double> &
 
 }  // namespace
 
-// Убираем : n_(0) - инициализация будет в классе
 MatmulDoubleOMPTask::MatmulDoubleOMPTask(const InType &in) {
   SetTypeOfTask(GetStaticTypeOfTask());
   GetInput() = in;
@@ -91,18 +103,14 @@ bool MatmulDoubleOMPTask::RunImpl() {
   // Получаем оптимальный размер блока
   const size_t block_size = GetOptimalBlockSize(n);
 
-  // Проверяем, что матрица может быть разбита на блоки
+  // Проверяем, что матрица может быть разбита на блоки нацело
   if (n % block_size != 0) {
-    // Если не делится нацело, используем блоки максимального размера
     return RunSimpleMultiply();
   }
 
   const size_t num_blocks = n / block_size;
 
   // Алгоритм Фокса для умножения матриц
-  // Фаза 1: Циклический сдвиг блоков матрицы B
-  // Фаза 2: Умножение и аккумуляция результатов
-
   // Для каждого блочного ряда в матрице C
   for (size_t i_block = 0; i_block < num_blocks; ++i_block) {
     // Для каждой фазы сдвига
