@@ -11,60 +11,6 @@
 
 namespace makoveeva_matmul_double_omp {
 
-namespace {
-
-// NOLINTNEXTLINE(readability-magic-numbers)
-constexpr size_t kBlockSize64 = 64;
-// NOLINTNEXTLINE(readability-magic-numbers)
-constexpr size_t kBlockSize128 = 128;
-// NOLINTNEXTLINE(readability-magic-numbers)
-constexpr size_t kBlockSize256 = 256;
-// NOLINTNEXTLINE(readability-magic-numbers)
-constexpr size_t kBlockSize512 = 512;
-
-// Получить оптимальный размер блока для алгоритма Фокса
-[[nodiscard]] size_t GetOptimalBlockSize(size_t n) {
-  // Используем степени двойки для лучшей локальности кэша
-  if (n <= kBlockSize64) {
-    return n;
-  }
-  if (n <= kBlockSize128) {
-    return kBlockSize64;
-  }
-  if (n <= kBlockSize256) {
-    return kBlockSize64;
-  }
-  if (n <= kBlockSize512) {
-    return kBlockSize128;
-  }
-  return kBlockSize256;
-}
-
-// Умножение блока матрицы A на блок матрицы B и добавление к блоку C
-void MultiplyBlocksAdd(const std::vector<double> &a, const std::vector<double> &b, std::vector<double> &c,
-                       size_t block_size, size_t block_row_a, size_t block_col_a, size_t block_row_b,
-                       size_t block_col_b, size_t block_row_c, size_t block_col_c, size_t n) {
-#pragma omp parallel for collapse(2) default(none) \
-    shared(a, b, c, n, block_size, block_row_a, block_col_a, block_row_b, block_col_b, block_row_c, block_col_c)
-  for (size_t i = 0; i < block_size; ++i) {
-    for (size_t j = 0; j < block_size; ++j) {
-      double sum = 0.0;
-      for (size_t k = 0; k < block_size; ++k) {
-        // NOLINTNEXTLINE(readability-magic-numbers)
-        const size_t idx_a = (block_row_a * block_size + i) * n + (block_col_a * block_size + k);
-        // NOLINTNEXTLINE(readability-magic-numbers)
-        const size_t idx_b = (block_row_b * block_size + k) * n + (block_col_b * block_size + j);
-        sum += a[idx_a] * b[idx_b];
-      }
-      // NOLINTNEXTLINE(readability-magic-numbers)
-      const size_t idx_c = (block_row_c * block_size + i) * n + (block_col_c * block_size + j);
-      c[idx_c] += sum;
-    }
-  }
-}
-
-}  // namespace
-
 MatmulDoubleOMPTask::MatmulDoubleOMPTask(const InType &in) {
   SetTypeOfTask(GetStaticTypeOfTask());
   GetInput() = in;
@@ -100,29 +46,52 @@ bool MatmulDoubleOMPTask::RunImpl() {
   const auto &b = b_;
   auto &c = c_;
 
-  // Получаем оптимальный размер блока
-  const size_t block_size = GetOptimalBlockSize(n);
+  // Выбираем размер блока для оптимальной локальности кэша
+  const size_t block_size = SelectBlockSize(n);
 
-  // Проверяем, что матрица может быть разбита на блоки нацело
+  // Проверяем что матрица делится нацело на размер блока
   if (n % block_size != 0) {
     return RunSimpleMultiply();
   }
 
-  const size_t num_blocks = n / block_size;
+  const size_t grid_size = n / block_size;
 
-  // Алгоритм Фокса для умножения матриц
-  // Для каждого блочного ряда в матрице C
-  for (size_t i_block = 0; i_block < num_blocks; ++i_block) {
-    // Для каждой фазы сдвига
-    for (size_t phase = 0; phase < num_blocks; ++phase) {
-      // Для каждого столбца блоков в текущем ряду
-      for (size_t j_block = 0; j_block < num_blocks; ++j_block) {
-        // Блок A из позиции (i_block, (j_block + phase) % num_blocks)
-        // Блок B из позиции ((j_block + phase) % num_blocks, j_block)
-        const size_t block_col_a = (j_block + phase) % num_blocks;
-        const size_t block_row_b = (j_block + phase) % num_blocks;
+  // Алгоритм Фокса: все итерации параллелизируются в один цикл
+  // step_i_j = step * grid_size * grid_size + i * grid_size + j
+  // где step - шаг сдвига, i - строка блока, j - столбец блока
+#pragma omp parallel for default(none) shared(a, b, c, n, block_size, grid_size)
+  for (size_t step_i_j = 0; step_i_j < grid_size * grid_size * grid_size; ++step_i_j) {
+    const size_t step = step_i_j / (grid_size * grid_size);
+    const size_t i = (step_i_j % (grid_size * grid_size)) / grid_size;
+    const size_t j = step_i_j % grid_size;
 
-        MultiplyBlocksAdd(a, b, c, block_size, i_block, block_col_a, block_row_b, j_block, i_block, j_block, n);
+    // Источник блока A: диагональный сдвиг на step позиций
+    const size_t root = (i + step) % grid_size;
+
+    // Локальный буфер для накопления результатов блока C[i][j]
+    std::vector<double> local_block(block_size * block_size, 0.0);
+
+    // Умножение блока A[i][root] на блок B[root][j]
+    for (size_t bi = 0; bi < block_size; ++bi) {
+      for (size_t bj = 0; bj < block_size; ++bj) {
+        double sum = 0.0;
+        for (size_t bk = 0; bk < block_size; ++bk) {
+          const size_t idx_a = ((i * block_size + bi) * n) + (root * block_size + bk);
+          const size_t idx_b = ((root * block_size + bk) * n) + (j * block_size + bj);
+          sum += a[idx_a] * b[idx_b];
+        }
+        local_block[(bi * block_size) + bj] += sum;
+      }
+    }
+
+    // Безопасно добавляем результат в матрицу C
+#pragma omp critical
+    {
+      for (size_t bi = 0; bi < block_size; ++bi) {
+        for (size_t bj = 0; bj < block_size; ++bj) {
+          const size_t idx_c = ((i * block_size + bi) * n) + (j * block_size + bj);
+          c[idx_c] += local_block[(bi * block_size) + bj];
+        }
       }
     }
   }
@@ -149,6 +118,21 @@ bool MatmulDoubleOMPTask::RunSimpleMultiply() {
   }
 
   return true;
+}
+
+[[nodiscard]] size_t MatmulDoubleOMPTask::SelectBlockSize(size_t n) const {
+  // Выбираем размер блока в зависимости от размера матрицы
+  // Используем степени двойки для хорошей локальности кэша
+  if (n <= 64) {
+    return n;
+  }
+  if (n <= 256) {
+    return 64;
+  }
+  if (n <= 1024) {
+    return 128;
+  }
+  return 256;
 }
 
 bool MatmulDoubleOMPTask::PostProcessingImpl() {

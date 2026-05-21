@@ -32,6 +32,8 @@ class MatmulDoubleOMPTask : public BaseTask {
   std::vector<double> c_;
 
   bool RunSimpleMultiply();
+
+  [[nodiscard]] size_t SelectBlockSize(size_t n) const;
 };
 
 }  // namespace makoveeva_matmul_double_omp
