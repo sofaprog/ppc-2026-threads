@@ -2,7 +2,6 @@
 
 #include <omp.h>
 
-#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -10,6 +9,64 @@
 #include "makoveeva_matmul_double_omp/common/include/common.hpp"
 
 namespace makoveeva_matmul_double_omp {
+
+namespace {
+
+// Выбирает размер блока в зависимости от размера матрицы
+[[nodiscard]] size_t SelectBlockSize(size_t n) {
+  // Используем степени двойки для хорошей локальности кэша
+  if (n <= 64) {
+    return n;
+  }
+  if (n <= 256) {
+    return 64;
+  }
+  if (n <= 1024) {
+    return 128;
+  }
+  return 256;
+}
+
+// Декодирует одномерный индекс в трёхмерный индекс (step, i, j)
+void DecodeIndex(size_t step_i_j, size_t grid_size, size_t &step, size_t &i, size_t &j) {
+  step = step_i_j / (grid_size * grid_size);
+  i = (step_i_j % (grid_size * grid_size)) / grid_size;
+  j = step_i_j % grid_size;
+}
+
+// Вычисляет root блок для алгоритма Фокса
+[[nodiscard]] size_t ComputeRoot(size_t i, size_t step, size_t grid_size) {
+  return (i + step) % grid_size;
+}
+
+// Умножает блок A[i][root] на блок B[root][j] и сохраняет в local_block
+void MultiplyBlocks(const std::vector<double> &a, const std::vector<double> &b, std::vector<double> &local_block,
+                    size_t i, size_t root, size_t j, size_t block_size, size_t n) {
+  for (size_t bi = 0; bi < block_size; ++bi) {
+    for (size_t bj = 0; bj < block_size; ++bj) {
+      double sum = 0.0;
+      for (size_t bk = 0; bk < block_size; ++bk) {
+        const size_t idx_a = ((i * block_size + bi) * n) + (root * block_size + bk);
+        const size_t idx_b = ((root * block_size + bk) * n) + (j * block_size + bj);
+        sum += a[idx_a] * b[idx_b];
+      }
+      local_block[(bi * block_size) + bj] += sum;
+    }
+  }
+}
+
+// Добавляет результат из local_block в матрицу C
+void AddBlockToResult(std::vector<double> &c, const std::vector<double> &local_block, size_t i, size_t j,
+                      size_t block_size, size_t n) {
+  for (size_t bi = 0; bi < block_size; ++bi) {
+    for (size_t bj = 0; bj < block_size; ++bj) {
+      const size_t idx_c = ((i * block_size + bi) * n) + (j * block_size + bj);
+      c[idx_c] += local_block[(bi * block_size) + bj];
+    }
+  }
+}
+
+}  // namespace
 
 MatmulDoubleOMPTask::MatmulDoubleOMPTask(const InType &in) {
   SetTypeOfTask(GetStaticTypeOfTask());
@@ -57,42 +114,26 @@ bool MatmulDoubleOMPTask::RunImpl() {
   const size_t grid_size = n / block_size;
 
   // Алгоритм Фокса: все итерации параллелизируются в один цикл
-  // step_i_j = step * grid_size * grid_size + i * grid_size + j
-  // где step - шаг сдвига, i - строка блока, j - столбец блока
 #pragma omp parallel for default(none) shared(a, b, c, n, block_size, grid_size)
   for (size_t step_i_j = 0; step_i_j < grid_size * grid_size * grid_size; ++step_i_j) {
-    const size_t step = step_i_j / (grid_size * grid_size);
-    const size_t i = (step_i_j % (grid_size * grid_size)) / grid_size;
-    const size_t j = step_i_j % grid_size;
+    size_t step = 0;
+    size_t i = 0;
+    size_t j = 0;
+    DecodeIndex(step_i_j, grid_size, step, i, j);
 
     // Источник блока A: диагональный сдвиг на step позиций
-    const size_t root = (i + step) % grid_size;
+    const size_t root = ComputeRoot(i, step, grid_size);
 
     // Локальный буфер для накопления результатов блока C[i][j]
     std::vector<double> local_block(block_size * block_size, 0.0);
 
     // Умножение блока A[i][root] на блок B[root][j]
-    for (size_t bi = 0; bi < block_size; ++bi) {
-      for (size_t bj = 0; bj < block_size; ++bj) {
-        double sum = 0.0;
-        for (size_t bk = 0; bk < block_size; ++bk) {
-          const size_t idx_a = ((i * block_size + bi) * n) + (root * block_size + bk);
-          const size_t idx_b = ((root * block_size + bk) * n) + (j * block_size + bj);
-          sum += a[idx_a] * b[idx_b];
-        }
-        local_block[(bi * block_size) + bj] += sum;
-      }
-    }
+    MultiplyBlocks(a, b, local_block, i, root, j, block_size, n);
 
     // Безопасно добавляем результат в матрицу C
 #pragma omp critical
     {
-      for (size_t bi = 0; bi < block_size; ++bi) {
-        for (size_t bj = 0; bj < block_size; ++bj) {
-          const size_t idx_c = ((i * block_size + bi) * n) + (j * block_size + bj);
-          c[idx_c] += local_block[(bi * block_size) + bj];
-        }
-      }
+      AddBlockToResult(c, local_block, i, j, block_size, n);
     }
   }
 
@@ -118,21 +159,6 @@ bool MatmulDoubleOMPTask::RunSimpleMultiply() {
   }
 
   return true;
-}
-
-[[nodiscard]] size_t MatmulDoubleOMPTask::SelectBlockSize(size_t n) const {
-  // Выбираем размер блока в зависимости от размера матрицы
-  // Используем степени двойки для хорошей локальности кэша
-  if (n <= 64) {
-    return n;
-  }
-  if (n <= 256) {
-    return 64;
-  }
-  if (n <= 1024) {
-    return 128;
-  }
-  return 256;
 }
 
 bool MatmulDoubleOMPTask::PostProcessingImpl() {
