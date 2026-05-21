@@ -177,7 +177,7 @@ bool MatmulDoubleSTLTask::RunSimpleMultiply() {
       const size_t start_row = t * rows_per_thread;
       const size_t end_row = (t == num_threads - 1) ? n : start_row + rows_per_thread;
 
-      threads.emplace_back([this, start_row, end_row, &a, &b, &c, n]() {
+      threads.emplace_back([start_row, end_row, &a, &b, &c, n]() {
         for (size_t i = start_row; i < end_row; ++i) {
           for (size_t j = 0; j < n; ++j) {
             double sum = 0.0;
